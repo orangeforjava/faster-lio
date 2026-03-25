@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <thread>
 
+#include "dynamic_removal.h"
 #include "imu_processing.hpp"
 #include "ivox3d/ivox3d.h"
 #include "options.h"
@@ -86,6 +87,7 @@ class LaserMapping {
     std::shared_ptr<IVoxType> ivox_ = nullptr;                    // localmap in ivox
     std::shared_ptr<PointCloudPreprocess> preprocess_ = nullptr;  // point cloud preprocess
     std::shared_ptr<ImuProcess> p_imu_ = nullptr;                 // imu process
+    DynamicObjectFilter dynamic_filter_;                           // dynamic object removal
 
     /// local map related
     float det_range_ = 300.0f;
@@ -109,6 +111,7 @@ class LaserMapping {
     std::vector<float> residuals_;                    // point-to-plane residuals
     std::vector<char> point_selected_surf_;           // selected points
     common::VV4F plane_coef_;                         // plane coeffs
+    std::vector<bool> is_dynamic_;                    // dynamic object flags
 
     /// ros pub and sub stuffs
     ros::Subscriber sub_pcl_;
