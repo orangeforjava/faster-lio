@@ -95,6 +95,12 @@ bool LaserMapping::LoadParams(ros::NodeHandle &nh) {
     nh.param<float>("ivox_grid_resolution", ivox_options_.resolution_, 0.2);
     nh.param<int>("ivox_nearby_type", ivox_nearby_type, 18);
 
+    nh.param<bool>("dynamic_removal/enable", dynamic_filter_.GetOptions().enable, false);
+    nh.param<float>("dynamic_removal/ground_height_threshold", dynamic_filter_.GetOptions().ground_height_threshold, -1.5f);
+    nh.param<float>("dynamic_removal/dynamic_height_max", dynamic_filter_.GetOptions().dynamic_height_max, 3.5f);
+    nh.param<float>("dynamic_removal/dynamic_ground_ratio", dynamic_filter_.GetOptions().dynamic_ground_ratio, 0.1f);
+    nh.param<int>("dynamic_removal/min_neighbor_points", dynamic_filter_.GetOptions().min_neighbor_points, 5);
+
     LOG(INFO) << "lidar_type " << lidar_type;
     if (lidar_type == 1) {
         preprocess_->SetLidarType(LidarType::AVIA);
@@ -193,6 +199,15 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
 
         ivox_options_.resolution_ = yaml["ivox_grid_resolution"].as<float>();
         ivox_nearby_type = yaml["ivox_nearby_type"].as<int>();
+
+        if (yaml["dynamic_removal"]) {
+            auto dr = yaml["dynamic_removal"];
+            if (dr["enable"]) dynamic_filter_.GetOptions().enable = dr["enable"].as<bool>();
+            if (dr["ground_height_threshold"]) dynamic_filter_.GetOptions().ground_height_threshold = dr["ground_height_threshold"].as<float>();
+            if (dr["dynamic_height_max"]) dynamic_filter_.GetOptions().dynamic_height_max = dr["dynamic_height_max"].as<float>();
+            if (dr["dynamic_ground_ratio"]) dynamic_filter_.GetOptions().dynamic_ground_ratio = dr["dynamic_ground_ratio"].as<float>();
+            if (dr["min_neighbor_points"]) dynamic_filter_.GetOptions().min_neighbor_points = dr["min_neighbor_points"].as<int>();
+        }
     } catch (...) {
         LOG(ERROR) << "bad conversion";
         return false;
@@ -297,6 +312,9 @@ void LaserMapping::Run() {
 
     /// the first scan
     if (flg_first_scan_) {
+        if (dynamic_filter_.IsEnabled()) {
+            dynamic_filter_.ClassifyGround(scan_undistort_);
+        }
         state_point_ = kf_.get_x();
         scan_down_world_->resize(scan_undistort_->size());
         for (int i = 0; i < scan_undistort_->size(); i++) {
@@ -322,6 +340,12 @@ void LaserMapping::Run() {
         LOG(WARNING) << "Too few points, skip this scan!" << scan_undistort_->size() << ", " << scan_down_body_->size();
         return;
     }
+
+    /// classify ground / non-ground (labels stored in normal_z field)
+    if (dynamic_filter_.IsEnabled()) {
+        dynamic_filter_.ClassifyGround(scan_down_body_);
+    }
+
     scan_down_world_->resize(cur_pts);
     nearest_points_.resize(cur_pts);
     residuals_.resize(cur_pts, 0);
@@ -513,6 +537,13 @@ void LaserMapping::MapIncremental() {
     points_to_add.reserve(cur_pts);
     point_no_need_downsample.reserve(cur_pts);
 
+    // Detect dynamic points before map update
+    if (dynamic_filter_.IsEnabled() && flg_EKF_inited_) {
+        dynamic_filter_.DetectDynamic(scan_down_body_, scan_down_world_, nearest_points_, is_dynamic_);
+    } else {
+        is_dynamic_.assign(cur_pts, false);
+    }
+
     std::vector<size_t> index(cur_pts);
     for (size_t i = 0; i < cur_pts; ++i) {
         index[i] = i;
@@ -521,6 +552,13 @@ void LaserMapping::MapIncremental() {
     std::for_each(std::execution::unseq, index.begin(), index.end(), [&](const size_t &i) {
         /* transform to world frame */
         PointBodyToWorld(&(scan_down_body_->points[i]), &(scan_down_world_->points[i]));
+        // Preserve ground label from body frame to world frame
+        scan_down_world_->points[i].normal_z = scan_down_body_->points[i].normal_z;
+
+        /* skip dynamic points */
+        if (is_dynamic_[i]) {
+            return;
+        }
 
         /* decide if need add to map */
         PointType &point_world = scan_down_world_->points[i];
@@ -847,6 +885,7 @@ void LaserMapping::PointBodyToWorld(const PointType *pi, PointType *const po) {
     po->y = p_global(1);
     po->z = p_global(2);
     po->intensity = pi->intensity;
+    po->normal_z = pi->normal_z;  // preserve ground label for dynamic removal
 }
 
 void LaserMapping::PointBodyToWorld(const common::V3F &pi, PointType *const po) {

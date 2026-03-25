@@ -1,6 +1,7 @@
 add_library(${PROJECT_NAME}
         laser_mapping.cc
         pointcloud_preprocess.cc
+        dynamic_removal.cc
         options.cc
         utils.cc
         )
