@@ -110,6 +110,9 @@ class LaserMapping {
     pcl::VoxelGrid<PointType> voxel_scan_;            // voxel filter for current scan
     std::vector<float> residuals_;                    // point-to-plane residuals
     std::vector<char> point_selected_surf_;           // selected points
+    std::vector<float> measurement_var_;              // per-point measurement variance
+    std::vector<Eigen::Vector3f> plane_center_;       // fitted plane centers
+    std::vector<float> plane_radius_;                 // fitted plane in-plane radius
     common::VV4F plane_coef_;                         // plane coeffs
     std::vector<bool> is_dynamic_;                    // dynamic object flags
 

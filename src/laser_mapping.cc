@@ -1,12 +1,36 @@
-#include <tf/transform_broadcaster.h>
-#include <yaml-cpp/yaml.h>
+#include <algorithm>
 #include <execution>
 #include <fstream>
+#include <cmath>
+#include <numeric>
+#include <tf/transform_broadcaster.h>
+#include <yaml-cpp/yaml.h>
 
 #include "laser_mapping.h"
 #include "utils.h"
 
 namespace faster_lio {
+
+namespace {
+constexpr float kMaxPlaneResidualSigma = 3.0f;
+constexpr float kPlaneRangeSigma = 3.0f;
+
+float ComputePlaneResidualVariance(const PointVector &points_near, const common::V4F &plane_coef) {
+    if (points_near.empty()) {
+        return static_cast<float>(options::LASER_POINT_COV);
+    }
+
+    double accum_residual = 0.0;
+    for (const auto &pt : points_near) {
+        Eigen::Vector4f temp = pt.getVector4fMap();
+        temp[3] = 1.0f;
+        const double residual = plane_coef.dot(temp);
+        accum_residual += residual * residual;
+    }
+
+    return static_cast<float>(accum_residual / static_cast<double>(points_near.size()));
+}
+}  // namespace
 
 bool LaserMapping::InitROS(ros::NodeHandle &nh) {
     LoadParams(nh);
@@ -348,9 +372,12 @@ void LaserMapping::Run() {
 
     scan_down_world_->resize(cur_pts);
     nearest_points_.resize(cur_pts);
-    residuals_.resize(cur_pts, 0);
-    point_selected_surf_.resize(cur_pts, true);
-    plane_coef_.resize(cur_pts, common::V4F::Zero());
+    residuals_.assign(cur_pts, 0);
+    point_selected_surf_.assign(cur_pts, false);
+    plane_coef_.assign(cur_pts, common::V4F::Zero());
+    measurement_var_.assign(cur_pts, options::LASER_POINT_COV);
+    plane_center_.assign(cur_pts, Eigen::Vector3f::Zero());
+    plane_radius_.assign(cur_pts, filter_size_map_min_);
 
     // ICP and iterated Kalman filter update
     Timer::Evaluate(
@@ -544,12 +571,13 @@ void LaserMapping::MapIncremental() {
         is_dynamic_.assign(cur_pts, false);
     }
 
-    std::vector<size_t> index(cur_pts);
-    for (size_t i = 0; i < cur_pts; ++i) {
-        index[i] = i;
-    }
+    std::vector<size_t> insert_order(cur_pts);
+    std::iota(insert_order.begin(), insert_order.end(), 0);
+    std::stable_sort(insert_order.begin(), insert_order.end(), [&](size_t a, size_t b) {
+        return measurement_var_[a] < measurement_var_[b];
+    });
 
-    std::for_each(std::execution::unseq, index.begin(), index.end(), [&](const size_t &i) {
+    std::for_each(std::execution::unseq, insert_order.begin(), insert_order.end(), [&](const size_t &i) {
         /* transform to world frame */
         PointBodyToWorld(&(scan_down_body_->points[i]), &(scan_down_world_->points[i]));
         // Preserve ground label from body frame to world frame
@@ -614,9 +642,7 @@ void LaserMapping::ObsModel(state_ikfom &s, esekfom::dyn_share_datastruct<double
     int cnt_pts = scan_down_body_->size();
 
     std::vector<size_t> index(cnt_pts);
-    for (size_t i = 0; i < index.size(); ++i) {
-        index[i] = i;
-    }
+    std::iota(index.begin(), index.end(), 0);
 
     Timer::Evaluate(
         [&, this]() {
@@ -634,14 +660,36 @@ void LaserMapping::ObsModel(state_ikfom &s, esekfom::dyn_share_datastruct<double
                 point_world.intensity = point_body.intensity;
 
                 auto &points_near = nearest_points_[i];
+                points_near.clear();
+                point_selected_surf_[i] = false;
+                measurement_var_[i] = options::LASER_POINT_COV;
                 if (ekfom_data.converge) {
                     /** Find the closest surfaces in the map **/
-                    points_near.clear();
                     ivox_->GetClosestPoint(point_world, points_near, options::NUM_MATCH_POINTS);
-                    point_selected_surf_[i] = points_near.size() >= options::MIN_NUM_MATCH_POINTS;
-                    if (point_selected_surf_[i]) {
-                        point_selected_surf_[i] =
-                            common::esti_plane(plane_coef_[i], points_near, options::ESTI_PLANE_THRESHOLD);
+                    if (points_near.size() >= options::MIN_NUM_MATCH_POINTS &&
+                        common::esti_plane(plane_coef_[i], points_near, options::ESTI_PLANE_THRESHOLD)) {
+                        point_selected_surf_[i] = true;
+                        measurement_var_[i] =
+                            ComputePlaneResidualVariance(points_near, plane_coef_[i]) + options::LASER_POINT_COV;
+                        Eigen::Vector3f center = Eigen::Vector3f::Zero();
+                        for (const auto &pt : points_near) {
+                            center += pt.getVector3fMap();
+                        }
+                        center /= static_cast<float>(points_near.size());
+                        plane_center_[i] = center;
+
+                        // in-plane spread (PV-LIO-PLUS style radius gating)
+                        float accum_tangential_sq = 0.0f;
+                        const Eigen::Vector3f n = plane_coef_[i].head<3>();
+                        for (const auto &pt : points_near) {
+                            Eigen::Vector3f diff = pt.getVector3fMap() - center;
+                            float normal_proj = diff.dot(n);
+                            float tangential_sq = std::max(0.0f, diff.squaredNorm() - normal_proj * normal_proj);
+                            accum_tangential_sq += tangential_sq;
+                        }
+                        plane_radius_[i] =
+                            std::sqrt(std::max(accum_tangential_sq / static_cast<float>(points_near.size()),
+                                               filter_size_map_min_ * filter_size_map_min_ * 0.25f));
                     }
                 }
 
@@ -650,9 +698,16 @@ void LaserMapping::ObsModel(state_ikfom &s, esekfom::dyn_share_datastruct<double
                     temp[3] = 1.0;
                     float pd2 = plane_coef_[i].dot(temp);
 
-                    bool valid_corr = p_body.norm() > 81 * pd2 * pd2;
+                    float tangential_sq =
+                        (point_world.getVector3fMap() - plane_center_[i]).squaredNorm() - pd2 * pd2;
+                    tangential_sq = std::max(0.0f, tangential_sq);
+                    const float range_dis = std::sqrt(tangential_sq);
+                    const float range_limit = kPlaneRangeSigma * plane_radius_[i];
+
+                    const float max_residual = kMaxPlaneResidualSigma * std::sqrt(measurement_var_[i]);
+                    bool valid_corr = (p_body.norm() > 81 * pd2 * pd2) && (std::abs(pd2) < max_residual) &&
+                                      (range_dis < range_limit);
                     if (valid_corr) {
-                        point_selected_surf_[i] = true;
                         residuals_[i] = pd2;
                     } else {
                         point_selected_surf_[i] = false;
@@ -668,9 +723,14 @@ void LaserMapping::ObsModel(state_ikfom &s, esekfom::dyn_share_datastruct<double
     corr_norm_.resize(cnt_pts);
     for (int i = 0; i < cnt_pts; i++) {
         if (point_selected_surf_[i]) {
-            corr_norm_[effect_feat_num_] = plane_coef_[i];
+            const float variance = std::max(measurement_var_[i], static_cast<float>(options::LASER_POINT_COV));
+            float weight = std::sqrt(options::LASER_POINT_COV / variance);
+            const float prob = std::exp(-0.5f * residuals_[i] * residuals_[i] / variance);
+            weight *= prob;
+
+            corr_norm_[effect_feat_num_] = plane_coef_[i] * weight;
             corr_pts_[effect_feat_num_] = scan_down_body_->points[i].getVector4fMap();
-            corr_pts_[effect_feat_num_][3] = residuals_[i];
+            corr_pts_[effect_feat_num_][3] = residuals_[i] * weight;
 
             effect_feat_num_++;
         }
