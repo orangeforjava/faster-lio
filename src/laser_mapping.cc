@@ -1,9 +1,10 @@
-#include <tf/transform_broadcaster.h>
-#include <yaml-cpp/yaml.h>
 #include <algorithm>
 #include <execution>
 #include <fstream>
 #include <cmath>
+#include <numeric>
+#include <tf/transform_broadcaster.h>
+#include <yaml-cpp/yaml.h>
 
 #include "laser_mapping.h"
 #include "utils.h"
@@ -12,6 +13,7 @@ namespace faster_lio {
 
 namespace {
 constexpr float kMaxPlaneResidualSigma = 3.0f;
+constexpr float kPlaneRangeSigma = 3.0f;
 
 float ComputePlaneResidualVariance(const PointVector &points_near, const common::V4F &plane_coef) {
     if (points_near.empty()) {
@@ -374,6 +376,8 @@ void LaserMapping::Run() {
     point_selected_surf_.assign(cur_pts, false);
     plane_coef_.assign(cur_pts, common::V4F::Zero());
     measurement_var_.assign(cur_pts, options::LASER_POINT_COV);
+    plane_center_.assign(cur_pts, Eigen::Vector3f::Zero());
+    plane_radius_.assign(cur_pts, filter_size_map_min_);
 
     // ICP and iterated Kalman filter update
     Timer::Evaluate(
@@ -667,6 +671,25 @@ void LaserMapping::ObsModel(state_ikfom &s, esekfom::dyn_share_datastruct<double
                         point_selected_surf_[i] = true;
                         measurement_var_[i] =
                             ComputePlaneResidualVariance(points_near, plane_coef_[i]) + options::LASER_POINT_COV;
+                        Eigen::Vector3f center = Eigen::Vector3f::Zero();
+                        for (const auto &pt : points_near) {
+                            center += pt.getVector3fMap();
+                        }
+                        center /= static_cast<float>(points_near.size());
+                        plane_center_[i] = center;
+
+                        // in-plane spread (PV-LIO-PLUS style radius gating)
+                        float accum_tangential_sq = 0.0f;
+                        const Eigen::Vector3f n = plane_coef_[i].head<3>();
+                        for (const auto &pt : points_near) {
+                            Eigen::Vector3f diff = pt.getVector3fMap() - center;
+                            float normal_proj = diff.dot(n);
+                            float tangential_sq = std::max(0.0f, diff.squaredNorm() - normal_proj * normal_proj);
+                            accum_tangential_sq += tangential_sq;
+                        }
+                        plane_radius_[i] =
+                            std::sqrt(std::max(accum_tangential_sq / static_cast<float>(points_near.size()),
+                                               filter_size_map_min_ * filter_size_map_min_ * 0.25f));
                     }
                 }
 
@@ -675,8 +698,15 @@ void LaserMapping::ObsModel(state_ikfom &s, esekfom::dyn_share_datastruct<double
                     temp[3] = 1.0;
                     float pd2 = plane_coef_[i].dot(temp);
 
+                    float tangential_sq =
+                        (point_world.getVector3fMap() - plane_center_[i]).squaredNorm() - pd2 * pd2;
+                    tangential_sq = std::max(0.0f, tangential_sq);
+                    const float range_dis = std::sqrt(tangential_sq);
+                    const float range_limit = kPlaneRangeSigma * plane_radius_[i];
+
                     const float max_residual = kMaxPlaneResidualSigma * std::sqrt(measurement_var_[i]);
-                    bool valid_corr = (p_body.norm() > 81 * pd2 * pd2) && (std::abs(pd2) < max_residual);
+                    bool valid_corr = (p_body.norm() > 81 * pd2 * pd2) && (std::abs(pd2) < max_residual) &&
+                                      (range_dis < range_limit);
                     if (valid_corr) {
                         residuals_[i] = pd2;
                     } else {
@@ -694,7 +724,9 @@ void LaserMapping::ObsModel(state_ikfom &s, esekfom::dyn_share_datastruct<double
     for (int i = 0; i < cnt_pts; i++) {
         if (point_selected_surf_[i]) {
             const float variance = std::max(measurement_var_[i], static_cast<float>(options::LASER_POINT_COV));
-            const float weight = std::sqrt(options::LASER_POINT_COV / variance);
+            float weight = std::sqrt(options::LASER_POINT_COV / variance);
+            const float prob = std::exp(-0.5f * residuals_[i] * residuals_[i] / variance);
+            weight *= prob;
 
             corr_norm_[effect_feat_num_] = plane_coef_[i] * weight;
             corr_pts_[effect_feat_num_] = scan_down_body_->points[i].getVector4fMap();
