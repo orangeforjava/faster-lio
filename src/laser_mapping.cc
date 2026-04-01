@@ -567,12 +567,13 @@ void LaserMapping::MapIncremental() {
         is_dynamic_.assign(cur_pts, false);
     }
 
-    std::vector<size_t> index(cur_pts);
-    for (size_t i = 0; i < cur_pts; ++i) {
-        index[i] = i;
-    }
+    std::vector<size_t> insert_order(cur_pts);
+    std::iota(insert_order.begin(), insert_order.end(), 0);
+    std::stable_sort(insert_order.begin(), insert_order.end(), [&](size_t a, size_t b) {
+        return measurement_var_[a] < measurement_var_[b];
+    });
 
-    std::for_each(std::execution::unseq, index.begin(), index.end(), [&](const size_t &i) {
+    std::for_each(std::execution::unseq, insert_order.begin(), insert_order.end(), [&](const size_t &i) {
         /* transform to world frame */
         PointBodyToWorld(&(scan_down_body_->points[i]), &(scan_down_world_->points[i]));
         // Preserve ground label from body frame to world frame
@@ -637,9 +638,7 @@ void LaserMapping::ObsModel(state_ikfom &s, esekfom::dyn_share_datastruct<double
     int cnt_pts = scan_down_body_->size();
 
     std::vector<size_t> index(cnt_pts);
-    for (size_t i = 0; i < index.size(); ++i) {
-        index[i] = i;
-    }
+    std::iota(index.begin(), index.end(), 0);
 
     Timer::Evaluate(
         [&, this]() {
